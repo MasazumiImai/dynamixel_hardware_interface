@@ -373,6 +373,13 @@ private:
 
   // Move dxl_comm_ to the end for safe destruction order
   std::shared_ptr<Dynamixel> dxl_comm_;
+
+  std::map<uint8_t, double> multi_turn_offsets_;
+  std::map<uint8_t, double> last_known_positions_;
+
+  void applyMultiTurnOffsets();
+  void removeMultiTurnOffsets();
+  void restoreMultiTurnOffsets();
 };
 
 // Conversion maps between ROS2 and Dynamixel interface names

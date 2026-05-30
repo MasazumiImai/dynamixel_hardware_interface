@@ -568,13 +568,19 @@ hardware_interface::CallbackReturn DynamixelHardware::start()
     }
   }
 
+  applyMultiTurnOffsets();
+
   CalcTransmissionToJoint();
 
   SyncJointCommandWithStates();
 
   CalcJointToTransmission();
 
+  removeMultiTurnOffsets();
+
   dxl_comm_->WriteMultiDxlData();
+
+  restoreMultiTurnOffsets();
 
   if (torque_enabled_comm_id_id_.size() > 0) {
     RCLCPP_INFO_STREAM(logger_, "Enabling torque for Dynamixels");
@@ -638,6 +644,8 @@ hardware_interface::return_type DynamixelHardware::read(
     read_error_duration_ = rclcpp::Duration(0, 0);
   }
 
+  applyMultiTurnOffsets();
+
   CalcTransmissionToJoint();
 
   for (auto sensor : hdl_gpio_sensor_states_) {
@@ -676,7 +684,11 @@ hardware_interface::return_type DynamixelHardware::write(
 
     CalcJointToTransmission();
 
+    removeMultiTurnOffsets();
+
     dxl_comm_->WriteMultiDxlData();
+
+    restoreMultiTurnOffsets();
 
     is_write_in_error_ = false;
     write_error_duration_ = rclcpp::Duration(0, 0);
@@ -787,6 +799,16 @@ DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
 bool DynamixelHardware::CommReset()
 {
   dxl_status_ = REBOOTING;
+
+  last_known_positions_.clear();
+  for (auto & state : hdl_trans_states_) {
+    for (size_t i = 0; i < state.interface_name_vec.size(); ++i) {
+      if (state.interface_name_vec[i] == "Present Position") {
+        last_known_positions_[state.id] = *(state.value_ptr_vec[i]);
+      }
+    }
+  }
+
   stop();
   RCLCPP_INFO_STREAM(logger_, "Communication Reset Start");
   dxl_comm_->RWDataReset();
@@ -812,6 +834,29 @@ bool DynamixelHardware::CommReset()
 
     RCLCPP_INFO_STREAM(logger_, "RESET Success");
     std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // Read the "raw zero-lap position" immediately after reboot and
+    // calculate the number of laps out of sync
+    dxl_comm_->ReadMultiDxlData(0.0);
+    for (auto & state : hdl_trans_states_) {
+      for (size_t i = 0; i < state.interface_name_vec.size(); ++i) {
+        if (state.interface_name_vec[i] == "Present Position") {
+          double raw_new_pos = *(state.value_ptr_vec[i]);
+          if (last_known_positions_.find(state.id) != last_known_positions_.end()) {
+            double last_pos = last_known_positions_[state.id];
+            double diff = last_pos - raw_new_pos;
+            double turns = std::round(diff / (2.0 * M_PI));
+            multi_turn_offsets_[state.id] = turns * 2.0 * M_PI;
+            RCLCPP_INFO_STREAM(logger_,
+              "\033[32m [Multi-turn Offset] ID: " << (int)state.id
+              << " | Last: " << last_pos << " | Raw: " << raw_new_pos
+              << " | Turns: " << turns << " | Offset: "
+              << multi_turn_offsets_[state.id] << " \033[0m");
+          }
+        }
+      }
+    }
+
     start();
     dxl_status_ = DXL_OK;
     return true;
@@ -1696,6 +1741,39 @@ std::string DynamixelHardware::getAllErrorSummaries() const
 
   all_summaries << "=====================================\n";
   return all_summaries.str();
+}
+
+void DynamixelHardware::applyMultiTurnOffsets()
+{
+  for (auto & state : hdl_trans_states_) {
+    for (size_t i = 0; i < state.interface_name_vec.size(); ++i) {
+      if (state.interface_name_vec[i] == "Present Position") {
+        *(state.value_ptr_vec[i]) += multi_turn_offsets_[state.id];
+      }
+    }
+  }
+}
+
+void DynamixelHardware::removeMultiTurnOffsets()
+{
+  for (auto & cmd : hdl_trans_commands_) {
+    for (size_t i = 0; i < cmd.interface_name_vec.size(); ++i) {
+      if (cmd.interface_name_vec[i] == "Goal Position") {
+        *(cmd.value_ptr_vec[i]) -= multi_turn_offsets_[cmd.id];
+      }
+    }
+  }
+}
+
+void DynamixelHardware::restoreMultiTurnOffsets()
+{
+  for (auto & cmd : hdl_trans_commands_) {
+    for (size_t i = 0; i < cmd.interface_name_vec.size(); ++i) {
+      if (cmd.interface_name_vec[i] == "Goal Position") {
+        *(cmd.value_ptr_vec[i]) += multi_turn_offsets_[cmd.id];
+      }
+    }
+  }
 }
 
 }  // namespace dynamixel_hardware_interface
