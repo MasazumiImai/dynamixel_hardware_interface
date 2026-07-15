@@ -112,6 +112,27 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     RCLCPP_INFO(logger_, "error_timeout_ms parameter not found, using default value of 500ms");
   }
 
+  // Asynchronous read/write: run blocking serial I/O in a background thread so
+  // that multiple hardware components (e.g. one serial bus per limb) communicate
+  // in parallel instead of sequentially inside the controller_manager thread.
+  if (info_.hardware_parameters.find("use_async_read_write") != info_.hardware_parameters.end()) {
+    use_async_ = info_.hardware_parameters.at("use_async_read_write") == "true";
+  }
+  if (info_.hardware_parameters.find("async_period_ms") != info_.hardware_parameters.end()) {
+    try {
+      async_period_ms_ = stod(info_.hardware_parameters.at("async_period_ms"));
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(
+        logger_, "Failed to parse async_period_ms parameter: %s, using default value", e.what());
+    }
+  }
+  if (!std::isfinite(async_period_ms_) || async_period_ms_ < 0.0) {
+    async_period_ms_ = 1.0;
+  }
+  RCLCPP_INFO(
+    logger_, "Asynchronous read/write is %s%s", use_async_ ? "ENABLED" : "DISABLED",
+    use_async_ ? (" (thread period " + std::to_string(async_period_ms_) + " ms)").c_str() : "");
+
   // Add new parameter for torque initialization
   bool disable_torque_at_init = false;
   if (info_.hardware_parameters.find("disable_torque_at_init") != info_.hardware_parameters.end()) {
@@ -595,11 +616,35 @@ hardware_interface::CallbackReturn DynamixelHardware::start()
 
   RCLCPP_INFO_STREAM(logger_, "Dynamixel Hardware Start!");
 
+  if (use_async_) {
+    // Safety: make sure no stale worker is left over from a previous activation.
+    comm_thread_running_.store(false, std::memory_order_release);
+    if (comm_thread_.joinable()) {
+      comm_thread_.join();
+    }
+    async_read_status_.store(hardware_interface::return_type::OK, std::memory_order_release);
+    async_write_status_.store(hardware_interface::return_type::OK, std::memory_order_release);
+    comm_thread_running_.store(true, std::memory_order_release);
+    comm_thread_ = std::thread(&DynamixelHardware::asyncCommLoop, this);
+    RCLCPP_INFO_STREAM(
+      logger_, "Async read/write thread started (period " << async_period_ms_ << " ms).");
+  }
+
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn DynamixelHardware::stop()
 {
+  // Stop the async worker first so no serial transfer runs concurrently with the
+  // torque-disable sequence below or with dxl_comm_ destruction.
+  if (comm_thread_running_.load(std::memory_order_acquire) || comm_thread_.joinable()) {
+    comm_thread_running_.store(false, std::memory_order_release);
+    if (comm_thread_.joinable()) {
+      comm_thread_.join();
+    }
+    RCLCPP_INFO_STREAM(logger_, "Async read/write thread stopped.");
+  }
+
   if (dxl_comm_) {
     dxl_comm_->DynamixelDisable(dxl_comm_id_id_);
     dxl_comm_->DynamixelDisable(virtual_dxl_comm_id_id_);
@@ -614,6 +659,18 @@ hardware_interface::CallbackReturn DynamixelHardware::stop()
 }
 
 hardware_interface::return_type DynamixelHardware::read(
+  const rclcpp::Time & time, const rclcpp::Duration & period)
+{
+  // In async mode the background thread performs the serial transfer and keeps
+  // the exported state interfaces continuously up to date; here we only surface
+  // the latest communication status to the controller_manager.
+  if (use_async_) {
+    return async_read_status_.load(std::memory_order_acquire);
+  }
+  return readCommunication(time, period);
+}
+
+hardware_interface::return_type DynamixelHardware::readCommunication(
   [[maybe_unused]] const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   double period_ms = period.seconds() * 1000;
@@ -675,6 +732,17 @@ hardware_interface::return_type DynamixelHardware::read(
   return hardware_interface::return_type::OK;
 }
 hardware_interface::return_type DynamixelHardware::write(
+  const rclcpp::Time & time, const rclcpp::Duration & period)
+{
+  // In async mode the background thread performs the serial transfer using the
+  // latest exported command interfaces; here we only surface the last status.
+  if (use_async_) {
+    return async_write_status_.load(std::memory_order_acquire);
+  }
+  return writeCommunication(time, period);
+}
+
+hardware_interface::return_type DynamixelHardware::writeCommunication(
   [[maybe_unused]] const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   if (dxl_status_ == DXL_OK || dxl_status_ == HW_ERROR) {
@@ -706,6 +774,44 @@ hardware_interface::return_type DynamixelHardware::write(
       return hardware_interface::return_type::ERROR;
     }
     return hardware_interface::return_type::OK;
+  }
+}
+
+void DynamixelHardware::asyncCommLoop()
+{
+  rclcpp::Time prev_time = this->now();
+
+  while (comm_thread_running_.load(std::memory_order_relaxed)) {
+    const rclcpp::Time now = this->now();
+    rclcpp::Duration period = now - prev_time;
+    prev_time = now;
+    if (period.seconds() <= 0.0) {
+      period = rclcpp::Duration::from_seconds(1e-6);
+    }
+
+    // read then write, mirroring the controller_manager's per-cycle ordering.
+    const auto read_status = readCommunication(now, period);
+    async_read_status_.store(read_status, std::memory_order_release);
+    const auto write_status = writeCommunication(now, period);
+    async_write_status_.store(write_status, std::memory_order_release);
+
+    // On a terminal error (comm failure exceeded err_timeout_ms) stop the worker
+    // so it does not keep driving a bus the framework will deactivate. The cached
+    // ERROR status is surfaced to the controller_manager on the next read()/write(),
+    // which triggers the normal deactivation path (stop() joins this thread).
+    if (read_status == hardware_interface::return_type::ERROR ||
+      write_status == hardware_interface::return_type::ERROR)
+    {
+      RCLCPP_ERROR_STREAM(
+        logger_, "Async read/write thread stopping due to terminal communication error.");
+      break;
+    }
+
+    // Cap the loop rate to avoid a busy spin when a transfer returns quickly
+    // (e.g. during REBOOTING). Serial I/O itself already paces the loop.
+    if (async_period_ms_ > 0.0) {
+      std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(async_period_ms_));
+    }
   }
 }
 

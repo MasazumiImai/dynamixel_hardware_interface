@@ -24,6 +24,8 @@
 #include <unordered_map>
 #include <functional>
 #include <utility>
+#include <atomic>
+#include <thread>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
@@ -380,6 +382,36 @@ private:
   void applyMultiTurnOffsets();
   void removeMultiTurnOffsets();
   void restoreMultiTurnOffsets();
+
+  // ===== Asynchronous read/write =====
+  // When enabled (hardware param "use_async_read_write":=true), the blocking
+  // serial read()/write() run in a dedicated background thread owned by this
+  // hardware component. With one component per limb, the 4 serial buses then
+  // communicate in parallel instead of sequentially inside the single
+  // controller_manager update thread. The framework-facing read()/write() only
+  // return the latest cached status (near-zero cost), so the control loop is no
+  // longer serialized on serial I/O. This introduces up to one worker cycle of
+  // latency in each direction (equivalent to ros2_control's native is_async).
+
+  /// @brief Blocking serial read (the original synchronous read() body).
+  hardware_interface::return_type readCommunication(
+    const rclcpp::Time & time, const rclcpp::Duration & period);
+
+  /// @brief Blocking serial write (the original synchronous write() body).
+  hardware_interface::return_type writeCommunication(
+    const rclcpp::Time & time, const rclcpp::Duration & period);
+
+  /// @brief Background loop that pairs readCommunication()/writeCommunication().
+  void asyncCommLoop();
+
+  bool use_async_{false};
+  double async_period_ms_{1.0};
+  std::thread comm_thread_;
+  std::atomic<bool> comm_thread_running_{false};
+  std::atomic<hardware_interface::return_type> async_read_status_{
+    hardware_interface::return_type::OK};
+  std::atomic<hardware_interface::return_type> async_write_status_{
+    hardware_interface::return_type::OK};
 };
 
 // Conversion maps between ROS2 and Dynamixel interface names
