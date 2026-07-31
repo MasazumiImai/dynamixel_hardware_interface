@@ -16,6 +16,7 @@
 
 #include "dynamixel_hardware_interface/dynamixel_hardware_interface.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -33,9 +34,22 @@
 namespace dynamixel_hardware_interface
 {
 
+namespace
+{
+
+std::string make_internal_node_name()
+{
+  static std::atomic<unsigned int> next_instance_id{0};
+  return "instance_" + std::to_string(next_instance_id.fetch_add(1));
+}
+
+}  // namespace
+
 DynamixelHardware::DynamixelHardware()
-: rclcpp::Node("dynamixel_hardware_interface"),
-  logger_(rclcpp::get_logger("dynamixel_hardware_interface"))
+: rclcpp::Node(
+    make_internal_node_name(),
+    "/dynamixel_hardware_interface"),
+  logger_(rclcpp::Node::get_logger())
 {
   dxl_status_ = DXL_OK;
   dxl_torque_status_ = TORQUE_ENABLED;
@@ -160,10 +174,14 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
   std::string dxl_model_folder = info_.hardware_parameters["dynamixel_model_folder"];
+  const bool enable_debug =
+    info_.hardware_parameters.find("enable_debug") != info_.hardware_parameters.end() &&
+    info_.hardware_parameters.at("enable_debug") == "true";
   dxl_comm_ = std::unique_ptr<Dynamixel>(
     new Dynamixel(
       (ament_index_cpp::get_package_share_directory("dynamixel_hardware_interface") +
-      dxl_model_folder).c_str()));
+      dxl_model_folder).c_str(),
+      enable_debug));
 
   RCLCPP_INFO_STREAM(logger_, "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$");
   RCLCPP_INFO_STREAM(logger_, "$$$$$ Init Dxl Comm Port");
@@ -369,7 +387,7 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     hdl_sensor_states_.push_back(temp_state);
   }
 
-  std::string str_dxl_state_pub_name = "dynamixel_hardware_interface/dxl_state";
+  std::string str_dxl_state_pub_name = "dxl_state";
   if (info_.hardware_parameters.find("dynamixel_state_pub_msg_name") !=
     info_.hardware_parameters.end())
   {
@@ -389,7 +407,7 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
   using namespace std::placeholders;
 
   // Get Dynamixel data service
-  std::string str_get_dxl_data_srv_name = "dynamixel_hardware_interface/get_dxl_data";
+  std::string str_get_dxl_data_srv_name = "get_dxl_data";
   if (info_.hardware_parameters.find("get_dynamixel_data_srv_name") !=
     info_.hardware_parameters.end())
   {
@@ -400,7 +418,7 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     std::bind(&DynamixelHardware::get_dxl_data_srv_callback, this, _1, _2));
 
   // Set Dynamixel data service
-  std::string str_set_dxl_data_srv_name = "dynamixel_hardware_interface/set_dxl_data";
+  std::string str_set_dxl_data_srv_name = "set_dxl_data";
   if (info_.hardware_parameters.find("set_dynamixel_data_srv_name") !=
     info_.hardware_parameters.end())
   {
@@ -411,7 +429,7 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     std::bind(&DynamixelHardware::set_dxl_data_srv_callback, this, _1, _2));
 
   // Reboot Dynamixel service
-  std::string str_reboot_dxl_srv_name = "dynamixel_hardware_interface/reboot_dxl";
+  std::string str_reboot_dxl_srv_name = "reboot_dxl";
   if (info_.hardware_parameters.find("reboot_dxl_srv_name") != info_.hardware_parameters.end()) {
     str_reboot_dxl_srv_name = info_.hardware_parameters["reboot_dxl_srv_name"];
   }
@@ -420,7 +438,7 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
     std::bind(&DynamixelHardware::reboot_dxl_srv_callback, this, _1, _2));
 
   // Set Dynamixel torque service
-  std::string str_set_dxl_torque_srv_name = "dynamixel_hardware_interface/set_dxl_torque";
+  std::string str_set_dxl_torque_srv_name = "set_dxl_torque";
   if (info_.hardware_parameters.find("set_dxl_torque_srv_name") !=
     info_.hardware_parameters.end())
   {
@@ -1390,13 +1408,16 @@ bool DynamixelHardware::SetMatrix()
     }
   }
 
-  fprintf(stderr, "transmission_to_joint_matrix_ \n");
+  std::ostringstream transmission_to_joint_matrix_output;
+  transmission_to_joint_matrix_output << "transmission_to_joint_matrix_\n";
   for (size_t i = 0; i < num_of_joints_; i++) {
     for (size_t j = 0; j < num_of_transmissions_; j++) {
-      fprintf(stderr, "[%zu][%zu] %lf, ", i, j, transmission_to_joint_matrix_[i][j]);
+      transmission_to_joint_matrix_output << "[" << i << "][" << j << "] "
+                                          << transmission_to_joint_matrix_[i][j] << ", ";
     }
-    fprintf(stderr, "\n");
+    transmission_to_joint_matrix_output << "\n";
   }
+  RCLCPP_DEBUG_STREAM(logger_, transmission_to_joint_matrix_output.str());
 
   joint_to_transmission_matrix_.assign(
     num_of_transmissions_, std::vector<double>(num_of_joints_, 0.0));
@@ -1441,13 +1462,16 @@ bool DynamixelHardware::SetMatrix()
   }
 
 
-  fprintf(stderr, "joint_to_transmission_matrix_ \n");
+  std::ostringstream joint_to_transmission_matrix_output;
+  joint_to_transmission_matrix_output << "joint_to_transmission_matrix_\n";
   for (size_t i = 0; i < num_of_transmissions_; i++) {
     for (size_t j = 0; j < num_of_joints_; j++) {
-      fprintf(stderr, "[%zu][%zu] %lf, ", i, j, joint_to_transmission_matrix_[i][j]);
+      joint_to_transmission_matrix_output << "[" << i << "][" << j << "] "
+                                          << joint_to_transmission_matrix_[i][j] << ", ";
     }
-    fprintf(stderr, "\n");
+    joint_to_transmission_matrix_output << "\n";
   }
+  RCLCPP_DEBUG_STREAM(logger_, joint_to_transmission_matrix_output.str());
 
   return true;
 }
@@ -1558,7 +1582,9 @@ void DynamixelHardware::SyncJointCommandWithStates()
           it_commands.interface_name_vec.end(),
           pos_cmd_name);
         if (cmd_it == it_commands.interface_name_vec.end()) {
-          RCLCPP_WARN_STREAM(
+          // State-only joints (for example a passive gripper joint) are valid
+          // and intentionally have no position command to synchronize.
+          RCLCPP_DEBUG_STREAM(
             logger_,
             "No position interface found in command interfaces for joint '" <<
               it_commands.name << "'. Skipping sync!");

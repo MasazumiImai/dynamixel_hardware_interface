@@ -67,6 +67,9 @@ These parameters define how the interface communicates with the Dynamixel motors
 
 - **`error_timeout_ms`**: Timeout for communication errors (in milliseconds).
 
+- **`enable_debug`**: Print detailed startup and communication configuration diagnostics. Defaults to
+  `false`; error messages are always printed.
+
 #### **2. Hardware Configuration**
 
 These parameters define the hardware setup:

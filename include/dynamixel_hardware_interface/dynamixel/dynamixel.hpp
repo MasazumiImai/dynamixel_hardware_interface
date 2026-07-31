@@ -195,6 +195,7 @@ private:
 
   // dxl info variable from dxl_model file
   DynamixelInfo dxl_info_;
+  bool verbose_;
 
   // item write variable
   std::vector<RWItemBufInfo> write_item_buf_;
@@ -237,7 +238,7 @@ private:
   std::map<uint8_t /*id*/, IndirectInfo> direct_info_write_;
 
 public:
-  explicit Dynamixel(const char * path);
+  explicit Dynamixel(const char * path, bool verbose = false);
   ~Dynamixel();
 
   // DXL Communication Setting
@@ -305,6 +306,8 @@ public:
     double offset_value);
 
 private:
+  void PrintDebug(const char * format, ...) const;
+
   bool checkReadType();
   bool checkWriteType();
 

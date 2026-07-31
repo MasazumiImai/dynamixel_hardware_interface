@@ -62,6 +62,7 @@ private:
   DxlModelList dxl_model_list_;
 
   std::string dxl_model_file_dir;
+  bool verbose_ = false;
 
   // Firmware version-aware model file selection
   std::string SelectModelFileByFirmwareVersion(
@@ -76,6 +77,7 @@ public:
   DynamixelInfo() {}
   ~DynamixelInfo() {}
 
+  void SetVerbose(bool verbose) {verbose_ = verbose;}
   void SetDxlModelFolderPath(const char * path);
   void InitDxlModelInfo();
 
