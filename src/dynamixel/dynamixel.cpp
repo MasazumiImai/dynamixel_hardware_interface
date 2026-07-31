@@ -221,7 +221,8 @@ DxlError Dynamixel::SetupPort(const std::string & port_name, const std::string &
   bool port_opened = false;
   for (int attempt = 0; attempt < MAX_COMM_RETRIES; ++attempt) {
     if (port_handler_->openPort()) {
-      PrintDebug(
+      fprintf(
+        stderr,
         "Succeeded to open the port [%s]! (attempt %d/%d)\n",
         port_name.c_str(),
         attempt + 1,
@@ -489,30 +490,30 @@ DxlError Dynamixel::SetMultiDxlRead()
 {
   read_type_ = checkReadType();
 
-  PrintDebug("Dynamixel Read Type : %s\n", read_type_ ? "bulk read" : "sync read");
+  fprintf(stderr, "Dynamixel Read Type : %s\n", read_type_ ? "bulk read" : "sync read");
   if (read_type_ == SYNC) {
-    PrintDebug("ID : ");
+    fprintf(stderr, "ID : ");
     for (auto it_read_data_list : read_data_list_) {
-      PrintDebug("%d, ", it_read_data_list.comm_id);
+      fprintf(stderr, "%d, ", it_read_data_list.comm_id);
     }
-    PrintDebug("\n");
-    PrintDebug("Read items : ");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Read items : ");
     if (!read_data_list_.empty()) {
       for (auto it_read_data_list_item_name : read_data_list_.at(0).item_name) {
-        PrintDebug("\t%s", it_read_data_list_item_name.c_str());
+        fprintf(stderr, "\t%s", it_read_data_list_item_name.c_str());
       }
     } else {
-      PrintDebug("(none)");
+      fprintf(stderr, "(none)");
     }
-    PrintDebug("\n");
+    fprintf(stderr, "\n");
   } else {
     for (auto it_read_data_list : read_data_list_) {
-      PrintDebug("ID : %d", it_read_data_list.comm_id);
-      PrintDebug("\tRead items : ");
+      fprintf(stderr, "ID : %d", it_read_data_list.comm_id);
+      fprintf(stderr, "\tRead items : ");
       for (auto it_read_data_list_item_name : it_read_data_list.item_name) {
-        PrintDebug("\t%s", it_read_data_list_item_name.c_str());
+        fprintf(stderr, "\t%s", it_read_data_list_item_name.c_str());
       }
-      PrintDebug("\n");
+      fprintf(stderr, "\n");
     }
   }
 
@@ -596,30 +597,30 @@ DxlError Dynamixel::SetMultiDxlWrite()
 {
   write_type_ = checkWriteType();
 
-  PrintDebug("Dynamixel Write Type : %s\n", write_type_ ? "bulk write" : "sync write");
+  fprintf(stderr, "Dynamixel Write Type : %s\n", write_type_ ? "bulk write" : "sync write");
   if (write_type_ == SYNC) {
-    PrintDebug("ID : ");
+    fprintf(stderr, "ID : ");
     for (auto it_id : write_data_list_) {
-      PrintDebug("%d, ", it_id.comm_id);
+      fprintf(stderr, "%d, ", it_id.comm_id);
     }
-    PrintDebug("\n");
-    PrintDebug("Write items : ");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Write items : ");
     if (!write_data_list_.empty()) {
       for (auto it_name : write_data_list_.at(0).item_name) {
-        PrintDebug("\t%s", it_name.c_str());
+        fprintf(stderr, "\t%s", it_name.c_str());
       }
     } else {
-      PrintDebug("(none)");
+      fprintf(stderr, "(none)");
     }
-    PrintDebug("\n");
+    fprintf(stderr, "\n");
   } else {
     for (auto it_id : write_data_list_) {
-      PrintDebug("ID : %d", it_id.comm_id);
-      PrintDebug("\tWrite items : ");
+      fprintf(stderr, "ID : %d", it_id.comm_id);
+      fprintf(stderr, "\tWrite items : ");
       for (auto it_name : it_id.item_name) {
-        PrintDebug("\t%s", it_name.c_str());
+        fprintf(stderr, "\t%s", it_name.c_str());
       }
-      PrintDebug("\n");
+      fprintf(stderr, "\n");
     }
   }
 

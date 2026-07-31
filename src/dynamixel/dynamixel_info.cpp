@@ -40,17 +40,17 @@ void DynamixelInfo::InitDxlModelInfo()
   std::string line;
   getline(open_file, line);
 
-  if (verbose_) {
-    fprintf(stderr, "Dynamixel Information File List.\n");
-  }
+  // if (verbose_) {
+  //   fprintf(stderr, "Dynamixel Information File List.\n");
+  // }
   while (!open_file.eof()) {
     uint16_t model_number;
     std::string file_name;
     open_file >> model_number >> file_name;
     if (open_file.good()) {
-      if (verbose_) {
-        fprintf(stderr, "num: %d, name: %s\n", model_number, file_name.c_str());
-      }
+      // if (verbose_) {
+      //   fprintf(stderr, "num: %d, name: %s\n", model_number, file_name.c_str());
+      // }
       dxl_model_list_.insert(std::make_pair(model_number, file_name));
     }
   }
