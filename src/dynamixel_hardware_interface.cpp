@@ -694,8 +694,12 @@ hardware_interface::return_type DynamixelHardware::readCommunication(
   double period_ms = period.seconds() * 1000;
 
   if (dxl_status_ == REBOOTING) {
-    RCLCPP_ERROR_STREAM(logger_, "Dynamixel Read Fail : REBOOTING");
-    return hardware_interface::return_type::ERROR;
+    // Hold the last state and report OK so the controller_manager keeps this and every other
+    // limb's controller active while this bus reboots. Returning ERROR here would deactivate the
+    // shared LimberoController and drop control of all limbs.
+    RCLCPP_WARN_STREAM_THROTTLE(
+      logger_, clock_, 1000, "Dynamixel rebooting: holding last state (control stays active).");
+    return hardware_interface::return_type::OK;
   } else if (dxl_status_ == DXL_OK || dxl_status_ == COMM_ERROR || dxl_status_ == HW_ERROR) {
     dxl_comm_err_ = CheckError(dxl_comm_->ReadMultiDxlData(period_ms));
     if (dxl_comm_err_ != DxlError::OK && dxl_comm_err_ != DxlError::DXL_HARDWARE_ERROR) {
@@ -763,6 +767,10 @@ hardware_interface::return_type DynamixelHardware::write(
 hardware_interface::return_type DynamixelHardware::writeCommunication(
   [[maybe_unused]] const rclcpp::Time & time, const rclcpp::Duration & period)
 {
+  if (dxl_status_ == REBOOTING) {
+    // Skip writes and report OK while rebooting so the shared controller stays active.
+    return hardware_interface::return_type::OK;
+  }
   if (dxl_status_ == DXL_OK || dxl_status_ == HW_ERROR) {
     dxl_comm_->WriteItemBuf();
 
@@ -872,10 +880,10 @@ DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
         if (!error_string.empty()) {
           RCLCPP_ERROR_STREAM_THROTTLE(
             logger_, clock_, 1000,
-            "Dynamixel Hardware Error States [ ID:" <<
-              static_cast<int>(hdl_trans_states_.at(i).id) << "] --> " <<
+            "\033[1;31m[Dynamixel Hardware Error] ID:" <<
+              static_cast<int>(hdl_trans_states_.at(i).id) << " --> " <<
               "0x" << std::hex << static_cast<int>(hw_error_status) << std::dec <<
-              " (" << static_cast<int>(hw_error_status) << "): " << error_string);
+              " (" << static_cast<int>(hw_error_status) << "): " << error_string << "\033[0m");
           dxl_status_ = HW_ERROR;
           error_state = DxlError::DXL_HARDWARE_ERROR;
         }
@@ -890,17 +898,17 @@ DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
           if (error_info) {
             RCLCPP_ERROR_STREAM_THROTTLE(
               logger_, clock_, 1000,
-              "Dynamixel Error Code [ ID:" <<
-                static_cast<int>(hdl_trans_states_.at(i).id) << "] --> " <<
+              "\033[1;31m[Dynamixel Error Code] ID:" <<
+                static_cast<int>(hdl_trans_states_.at(i).id) << " --> " <<
                 "0x" << std::hex << static_cast<int>(error_code) << std::dec <<
-                " (" << error_info->label << "): " << error_info->description);
+                " (" << error_info->label << "): " << error_info->description << "\033[0m");
           } else {
             RCLCPP_ERROR_STREAM_THROTTLE(
               logger_, clock_, 1000,
-              "Dynamixel Error Code [ ID:" <<
-                static_cast<int>(hdl_trans_states_.at(i).id) << "] --> " <<
+              "\033[1;31m[Dynamixel Error Code] ID:" <<
+                static_cast<int>(hdl_trans_states_.at(i).id) << " --> " <<
                 "0x" << std::hex << static_cast<int>(error_code) << std::dec <<
-                " (Unknown Error Code)");
+                " (Unknown Error Code)\033[0m");
           }
           dxl_status_ = HW_ERROR;
           error_state = DxlError::DXL_HARDWARE_ERROR;
@@ -924,6 +932,26 @@ bool DynamixelHardware::CommReset()
 {
   dxl_status_ = REBOOTING;
 
+  // Reboot only the dynamixel(s) currently flagged with an error; if none are flagged
+  // (e.g. a manual reboot) fall back to rebooting every dynamixel on this bus.
+  std::vector<std::pair<uint8_t, uint8_t>> reboot_targets;
+  for (const auto & pr : dxl_comm_id_id_) {
+    const uint8_t id = pr.second;
+    const bool hw_err = dxl_hw_err_.count(id) && dxl_hw_err_.at(id) != 0;
+    const bool code_err = dxl_error_code_.count(id) && dxl_error_code_.at(id) != 0x00;
+    if (hw_err || code_err) {
+      reboot_targets.push_back(pr);
+      RCLCPP_ERROR_STREAM(
+        logger_, "\033[1;31m[Reboot] Target ID " << static_cast<int>(id) << "\n"
+                                                 << getErrorSummary(id) << "\033[0m");
+    }
+  }
+  if (reboot_targets.empty()) {
+    reboot_targets = dxl_comm_id_id_;
+    RCLCPP_WARN_STREAM(
+      logger_, "[Reboot] No error-flagged dynamixel found; rebooting all on this bus.");
+  }
+
   last_known_positions_.clear();
   for (auto & state : hdl_trans_states_) {
     for (size_t i = 0; i < state.interface_name_vec.size(); ++i) {
@@ -942,9 +970,9 @@ bool DynamixelHardware::CommReset()
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     RCLCPP_INFO_STREAM(logger_, "Reset Start");
     bool result = true;
-    for (auto pr : dxl_comm_id_id_) {
+    for (auto pr : reboot_targets) {
       if (dxl_comm_->Reboot(pr.first) != DxlError::OK) {
-        RCLCPP_ERROR_STREAM(logger_, "Cannot reboot dynamixel! :(");
+        RCLCPP_ERROR_STREAM(logger_, "\033[1;31mCannot reboot dynamixel! :(\033[0m");
         result = false;
         break;
       }
@@ -985,9 +1013,10 @@ bool DynamixelHardware::CommReset()
     dxl_status_ = DXL_OK;
     return true;
   }
-  RCLCPP_ERROR_STREAM(logger_, "RESET Failure");
+  RCLCPP_ERROR_STREAM(logger_, "\033[1;31m[Reboot] RESET Failure\033[0m");
   std::this_thread::sleep_for(std::chrono::seconds(1));
   start();
+  dxl_status_ = DXL_OK;  // resume normal read/write so a failed reboot re-surfaces the error
   return false;
 }
 
