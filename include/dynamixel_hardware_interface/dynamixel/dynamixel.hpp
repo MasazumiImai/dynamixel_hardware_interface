@@ -189,6 +189,7 @@ typedef struct
 class Dynamixel
 {
 private:
+  friend struct StartupCheck;
   // dxl communication variable
   dynamixel::PortHandler * port_handler_ = nullptr;
   dynamixel::PacketHandler * packet_handler_ = nullptr;
@@ -261,8 +262,10 @@ public:
 
   // Read Item (sync or bulk)
   DxlError ReadMultiDxlData(double period_ms);
+  DxlError ReadStartupState();
   // Write Item (sync or bulk)
   DxlError WriteMultiDxlData();
+  DxlError VerifyMultiDxlWrite();
 
   // Set Dxl Option
   // DxlError SetOperatingMode(uint8_t id, uint8_t dynamixel_mode);
@@ -276,7 +279,9 @@ public:
   DxlError WriteItemBuf();
 
   // DXL Item Read
-  DxlError ReadItem(uint8_t comm_id, uint8_t id, std::string item_name, uint32_t & data);
+  DxlError ReadItem(
+    uint8_t comm_id, uint8_t id, std::string item_name, uint32_t & data,
+    bool allow_hardware_error = true);
   DxlError InsertReadItemBuf(uint8_t id, std::string item_name);
   DxlError ReadItemBuf();
   bool CheckReadItemBuf(uint8_t id, std::string item_name);
@@ -306,6 +311,10 @@ public:
     double offset_value);
 
 private:
+  DxlError SetTorqueState(
+    const std::vector<std::pair<uint8_t, uint8_t>> & devices, bool enable);
+  uint32_t ConvertWriteValue(
+    uint8_t comm_id, uint8_t id, const std::string & item_name, double value, uint8_t size);
   void PrintDebug(const char * format, ...) const;
 
   bool checkReadType();

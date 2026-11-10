@@ -632,47 +632,151 @@ hardware_interface::CallbackReturn DynamixelHardware::start()
     bindAsyncInterfaces();
   }
 
-  rclcpp::Time start_time = this->now();
-  rclcpp::Duration error_duration(0, 0);
-  while (true) {
-    dxl_comm_err_ = CheckError(dxl_comm_->ReadMultiDxlData(0.0));
+  async_read_status_.store(hardware_interface::return_type::ERROR, std::memory_order_release);
+  async_write_status_.store(hardware_interface::return_type::ERROR, std::memory_order_release);
+  const auto fail_start = [this](const std::string & reason) {
+      RCLCPP_ERROR_STREAM(logger_, "Dynamixel Hardware Start aborted: " << reason);
+      // Do not trust the torque cache, including after a partially acknowledged enable.
+      const auto real = dxl_comm_->DynamixelDisable(dxl_comm_id_id_);
+      const auto virtual_result = dxl_comm_->DynamixelDisable(virtual_dxl_comm_id_id_);
+      if (real != DxlError::OK || virtual_result != DxlError::OK) {
+        RCLCPP_ERROR_STREAM(logger_, "Torque OFF could not be confirmed on all devices.");
+      } else {
+        dxl_torque_status_ = TORQUE_DISABLED;
+      }
+      dxl_status_ = COMM_ERROR;
+      return hardware_interface::CallbackReturn::ERROR;
+    };
+
+  // Startup owns the bus until all checks pass; controllers and the async worker remain inactive.
+  const auto real_off = dxl_comm_->DynamixelDisable(dxl_comm_id_id_);
+  const auto virtual_off = dxl_comm_->DynamixelDisable(virtual_dxl_comm_id_id_);
+  if (real_off != DxlError::OK || virtual_off != DxlError::OK) {
+    return fail_start("initial torque OFF was not confirmed");
+  }
+
+  const auto start_time = std::chrono::steady_clock::now();
+  do {
+    dxl_comm_err_ = CheckError(dxl_comm_->ReadStartupState());
     if (dxl_comm_err_ == DxlError::OK) {
       break;
     }
-    error_duration = this->now() - start_time;
-    if (error_duration.seconds() * 1000 >= err_timeout_ms_) {
-      RCLCPP_ERROR_STREAM(
-        logger_,
-        "Dynamixel Start Fail (Timeout: " << error_duration.seconds() * 1000 << "ms/" <<
-          err_timeout_ms_ << "ms): " << Dynamixel::DxlErrorToString(dxl_comm_err_));
-      return hardware_interface::CallbackReturn::ERROR;
+  } while (std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - start_time).count() < err_timeout_ms_);
+  if (dxl_comm_err_ != DxlError::OK) {
+    return fail_start("initial state read failed: " + Dynamixel::DxlErrorToString(dxl_comm_err_));
+  }
+
+  for (const auto & gpio : info_.gpios) {
+    const auto mode = gpio.parameters.find("Operating Mode");
+    if (mode == gpio.parameters.end()) {
+      continue;
+    }
+    const uint8_t id = static_cast<uint8_t>(std::stoi(gpio.parameters.at("ID")));
+    const auto comm = gpio.parameters.find("comm_id");
+    const uint8_t comm_id = comm == gpio.parameters.end() ? id : std::stoi(comm->second);
+    uint32_t actual_mode = 0;
+    if (dxl_comm_->ReadItem(comm_id, id, "Operating Mode", actual_mode, false) != DxlError::OK ||
+      actual_mode != static_cast<uint32_t>(std::stoi(mode->second)))
+    {
+      return fail_start(gpio.name + ": operating mode was not confirmed");
+    }
+    const auto required = actual_mode == 1 ? "Goal Velocity" : "Goal Position";
+    if (std::find(
+        torque_enabled_comm_id_id_.begin(), torque_enabled_comm_id_id_.end(),
+        std::make_pair(comm_id, id)) != torque_enabled_comm_id_id_.end() &&
+      (actual_mode == 1 || actual_mode == 3 || actual_mode == 4 || actual_mode == 5))
+    {
+      const auto command = std::find_if(
+        gpio.command_interfaces.begin(), gpio.command_interfaces.end(),
+        [required](const hardware_interface::InterfaceInfo & interface) {
+          return interface.name == required;
+        });
+      if (command == gpio.command_interfaces.end()) {
+        return fail_start(gpio.name + ": no stop/hold command interface for operating mode");
+      }
     }
   }
 
   applyMultiTurnOffsets();
-
   CalcTransmissionToJoint();
-
-  SyncJointCommandWithStates();
-
-  CalcJointToTransmission();
-
-  removeMultiTurnOffsets();
-
-  dxl_comm_->WriteMultiDxlData();
-
-  restoreMultiTurnOffsets();
-
-  if (torque_enabled_comm_id_id_.size() > 0) {
-    RCLCPP_INFO_STREAM(logger_, "Enabling torque for Dynamixels");
-    for (int i = 0; i < 10; i++) {
-      if (dxl_comm_->DynamixelEnable(torque_enabled_comm_id_id_) == DxlError::OK) {
-        break;
+  // Zero retained velocity/effort commands on every activation, including a restart after failure.
+  for (auto * handlers : {&hdl_joint_commands_, &hdl_trans_commands_,
+      &hdl_gpio_controller_commands_})
+  {
+    for (auto & handler : *handlers) {
+      for (auto & value : handler.value_ptr_vec) {
+        *value = 0.0;
       }
-      RCLCPP_ERROR_STREAM(logger_, "Failed to enable torque for Dynamixels, retry...");
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
+  for (const auto & command : hdl_joint_commands_) {
+    for (const auto & interface : command.interface_name_vec) {
+      if (interface != hardware_interface::HW_IF_POSITION) {
+        continue;
+      }
+      bool valid = false;
+      for (const auto & state : hdl_joint_states_) {
+        if (state.name != command.name) {continue;}
+        for (size_t i = 0; i < state.interface_name_vec.size(); ++i) {
+          if (state.interface_name_vec[i] == interface) {
+            valid = std::isfinite(*state.value_ptr_vec[i]);
+          }
+        }
+      }
+      if (!valid) {
+        return fail_start(command.name + ": no valid initial position");
+      }
+    }
+  }
+  SyncJointCommandWithStates();
+  CalcJointToTransmission();
+  removeMultiTurnOffsets();
+  // Reject invalid mapped commands before unit conversion or transmission.
+  for (const auto & command : hdl_trans_commands_) {
+    for (size_t i = 0; i < command.interface_name_vec.size(); ++i) {
+      const auto & interface = command.interface_name_vec[i];
+      const double value = *command.value_ptr_vec[i];
+      if (!std::isfinite(value)) {
+        restoreMultiTurnOffsets();
+        return fail_start(command.name + ": non-finite initial command");
+      }
+      if (interface == "Goal Velocity" || interface == "Goal Current" || interface == "Goal PWM") {
+        if (value != 0.0) {
+          restoreMultiTurnOffsets();
+          return fail_start(command.name + ": initial motion command is not zero");
+        }
+      }
+    }
+  }
+  dxl_comm_err_ = dxl_comm_->WriteMultiDxlData();
+  if (dxl_comm_err_ == DxlError::OK) {
+    dxl_comm_err_ = dxl_comm_->VerifyMultiDxlWrite();
+  }
+  restoreMultiTurnOffsets();
+  if (dxl_comm_err_ != DxlError::OK) {
+    return fail_start(
+      "initial stop/hold command was not confirmed: " +
+      Dynamixel::DxlErrorToString(dxl_comm_err_));
+  }
+
+  if (dxl_comm_->DynamixelEnable(torque_enabled_comm_id_id_) != DxlError::OK) {
+    return fail_start("torque ON was not confirmed");
+  }
+  // Enabling torque may reset a device's position counter. Export a fresh state, not the old one.
+  dxl_comm_err_ = CheckError(dxl_comm_->ReadStartupState());
+  if (dxl_comm_err_ != DxlError::OK) {
+    return fail_start("state read after torque ON failed");
+  }
+  applyMultiTurnOffsets();
+  CalcTransmissionToJoint();
+  SyncJointCommandWithStates();
+  dxl_status_ = DXL_OK;
+  dxl_torque_status_ = torque_enabled_comm_id_id_.empty() ? TORQUE_DISABLED : TORQUE_ENABLED;
+  is_read_in_error_ = false;
+  is_write_in_error_ = false;
+  read_error_duration_ = rclcpp::Duration(0, 0);
+  write_error_duration_ = rclcpp::Duration(0, 0);
 
   RCLCPP_INFO_STREAM(logger_, "Dynamixel Hardware Start!");
 
@@ -704,8 +808,12 @@ hardware_interface::CallbackReturn DynamixelHardware::stop()
   }
 
   if (dxl_comm_) {
-    dxl_comm_->DynamixelDisable(dxl_comm_id_id_);
-    dxl_comm_->DynamixelDisable(virtual_dxl_comm_id_id_);
+    const auto real = dxl_comm_->DynamixelDisable(dxl_comm_id_id_);
+    const auto virtual_result = dxl_comm_->DynamixelDisable(virtual_dxl_comm_id_id_);
+    if (real != DxlError::OK || virtual_result != DxlError::OK) {
+      RCLCPP_ERROR_STREAM(logger_, "Dynamixel Hardware Stop: torque OFF was not confirmed.");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
   } else {
     RCLCPP_ERROR_STREAM(logger_, "Dynamixel Hardware Stop Fail : dxl_comm_ is nullptr");
     return hardware_interface::CallbackReturn::ERROR;
@@ -1052,14 +1160,11 @@ bool DynamixelHardware::CommReset()
       }
     }
 
-    start();
-    dxl_status_ = DXL_OK;
-    return true;
+    return start() == hardware_interface::CallbackReturn::SUCCESS;
   }
   RCLCPP_ERROR_STREAM(logger_, "\033[1;31m[Reboot] RESET Failure\033[0m");
   std::this_thread::sleep_for(std::chrono::seconds(1));
   start();
-  dxl_status_ = DXL_OK;  // resume normal read/write so a failed reboot re-surfaces the error
   return false;
 }
 

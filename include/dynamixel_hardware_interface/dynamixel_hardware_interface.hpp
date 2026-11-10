@@ -176,6 +176,7 @@ public:
     const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 private:
+  friend struct StartupCheck;
   ///// ros
   rclcpp::Logger logger_;
   rclcpp::Clock clock_;
