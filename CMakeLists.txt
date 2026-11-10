@@ -91,6 +91,19 @@ install(
 )
 
 if(BUILD_TESTING)
+  find_package(Threads REQUIRED)
+  add_executable(check_async_interface_buffer test/check_async_interface_buffer.cpp)
+  target_include_directories(check_async_interface_buffer PRIVATE include)
+  target_link_libraries(check_async_interface_buffer Threads::Threads)
+  add_test(NAME check_async_interface_buffer COMMAND check_async_interface_buffer)
+
+  add_executable(check_startup test/check_startup.cpp)
+  target_link_libraries(check_startup ${PROJECT_NAME})
+  add_test(NAME check_startup COMMAND check_startup ${PROJECT_SOURCE_DIR}/param/dxl_model)
+  set_tests_properties(check_startup PROPERTIES
+    ENVIRONMENT "ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_ros_log;ROS_LOCALHOST_ONLY=1;ROS_DOMAIN_ID=230"
+    TIMEOUT 60)
+
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
