@@ -451,6 +451,39 @@ hardware_interface::CallbackReturn DynamixelHardware::on_init(
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
+double * DynamixelHardware::exportedValue(
+  AsyncInterfaceBuffer & buffer, const HandlerVarType & handler, size_t index)
+{
+  const auto & value = handler.value_ptr_vec.at(index);
+  if (!use_async_) {
+    return value.get();
+  }
+  return buffer.bind(handler.name + "/" + handler.interface_name_vec.at(index), value);
+}
+
+void DynamixelHardware::bindAsyncInterfaces()
+{
+  // Rebind raw GPIO storage after communication handlers have been rebuilt.
+  for (const auto * group : {&hdl_trans_states_, &hdl_joint_states_, &hdl_sensor_states_,
+      &hdl_gpio_controller_states_})
+  {
+    for (const auto & handler : *group) {
+      for (size_t i = 0; i < handler.value_ptr_vec.size(); ++i) {
+        exportedValue(async_states_, handler, i);
+      }
+    }
+  }
+  for (const auto * group : {&hdl_trans_commands_, &hdl_joint_commands_,
+      &hdl_gpio_controller_commands_})
+  {
+    for (const auto & handler : *group) {
+      for (size_t i = 0; i < handler.value_ptr_vec.size(); ++i) {
+        exportedValue(async_commands_, handler, i);
+      }
+    }
+  }
+}
+
 std::vector<hardware_interface::StateInterface>
 DynamixelHardware::export_state_interfaces()
 {
@@ -469,7 +502,7 @@ DynamixelHardware::export_state_interfaces()
         }
         state_interfaces.emplace_back(
           hardware_interface::StateInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_states_, it, i)));
       }
     }
     for (auto it : hdl_joint_states_) {
@@ -483,7 +516,7 @@ DynamixelHardware::export_state_interfaces()
         }
         state_interfaces.emplace_back(
           hardware_interface::StateInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_states_, it, i)));
       }
     }
     for (auto it : hdl_sensor_states_) {
@@ -497,7 +530,7 @@ DynamixelHardware::export_state_interfaces()
         }
         state_interfaces.emplace_back(
           hardware_interface::StateInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_states_, it, i)));
       }
     }
     for (auto it : hdl_gpio_controller_states_) {
@@ -511,7 +544,7 @@ DynamixelHardware::export_state_interfaces()
         }
         state_interfaces.emplace_back(
           hardware_interface::StateInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_states_, it, i)));
       }
     }
   } catch (const std::exception & e) {
@@ -538,7 +571,7 @@ DynamixelHardware::export_command_interfaces()
         }
         command_interfaces.emplace_back(
           hardware_interface::CommandInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_commands_, it, i)));
       }
     }
     for (auto it : hdl_joint_commands_) {
@@ -552,7 +585,7 @@ DynamixelHardware::export_command_interfaces()
         }
         command_interfaces.emplace_back(
           hardware_interface::CommandInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_commands_, it, i)));
       }
     }
     for (auto it : hdl_gpio_controller_commands_) {
@@ -566,7 +599,7 @@ DynamixelHardware::export_command_interfaces()
         }
         command_interfaces.emplace_back(
           hardware_interface::CommandInterface(
-            it.name, it.interface_name_vec.at(i), it.value_ptr_vec.at(i).get()));
+            it.name, it.interface_name_vec.at(i), exportedValue(async_commands_, it, i)));
       }
     }
   } catch (const std::exception & e) {
@@ -590,6 +623,15 @@ hardware_interface::CallbackReturn DynamixelHardware::on_deactivate(
 
 hardware_interface::CallbackReturn DynamixelHardware::start()
 {
+  // Lifecycle setup must not modify the handlers while an old worker still owns them.
+  comm_thread_running_.store(false, std::memory_order_release);
+  if (comm_thread_.joinable()) {
+    comm_thread_.join();
+  }
+  if (use_async_) {
+    bindAsyncInterfaces();
+  }
+
   rclcpp::Time start_time = this->now();
   rclcpp::Duration error_duration(0, 0);
   while (true) {
@@ -635,11 +677,9 @@ hardware_interface::CallbackReturn DynamixelHardware::start()
   RCLCPP_INFO_STREAM(logger_, "Dynamixel Hardware Start!");
 
   if (use_async_) {
-    // Safety: make sure no stale worker is left over from a previous activation.
-    comm_thread_running_.store(false, std::memory_order_release);
-    if (comm_thread_.joinable()) {
-      comm_thread_.join();
-    }
+    // Seed the exported values from the completed initial read before controllers activate.
+    async_states_.initialize();
+    async_commands_.initialize();
     async_read_status_.store(hardware_interface::return_type::OK, std::memory_order_release);
     async_write_status_.store(hardware_interface::return_type::OK, std::memory_order_release);
     comm_thread_running_.store(true, std::memory_order_release);
@@ -679,10 +719,9 @@ hardware_interface::CallbackReturn DynamixelHardware::stop()
 hardware_interface::return_type DynamixelHardware::read(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  // In async mode the background thread performs the serial transfer and keeps
-  // the exported state interfaces continuously up to date; here we only surface
-  // the latest communication status to the controller_manager.
   if (use_async_) {
+    async_states_.readState();
+    async_commands_.readCommandUpdates();
     return async_read_status_.load(std::memory_order_acquire);
   }
   return readCommunication(time, period);
@@ -756,9 +795,8 @@ hardware_interface::return_type DynamixelHardware::readCommunication(
 hardware_interface::return_type DynamixelHardware::write(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  // In async mode the background thread performs the serial transfer using the
-  // latest exported command interfaces; here we only surface the last status.
   if (use_async_) {
+    async_commands_.writeCommands();
     return async_write_status_.load(std::memory_order_acquire);
   }
   return writeCommunication(time, period);
@@ -815,8 +853,11 @@ void DynamixelHardware::asyncCommLoop()
       period = rclcpp::Duration::from_seconds(1e-6);
     }
 
-    // read then write, mirroring the controller_manager's per-cycle ordering.
+    // Latch one complete command before I/O. A service handled during readCommunication()
+    // may then synchronize a position command without having it overwritten before the write.
+    async_commands_.applyCommands();
     const auto read_status = readCommunication(now, period);
+    async_states_.captureState();
     async_read_status_.store(read_status, std::memory_order_release);
     const auto write_status = writeCommunication(now, period);
     async_write_status_.store(write_status, std::memory_order_release);
@@ -999,11 +1040,13 @@ bool DynamixelHardware::CommReset()
             double diff = last_pos - raw_new_pos;
             double turns = std::round(diff / (2.0 * M_PI));
             multi_turn_offsets_[state.id] = turns * 2.0 * M_PI;
-            RCLCPP_INFO_STREAM(logger_,
+            RCLCPP_INFO_STREAM(
+              logger_,
               "\033[32m [Multi-turn Offset] ID: " << (int)state.id
-              << " | Last: " << last_pos << " | Raw: " << raw_new_pos
-              << " | Turns: " << turns << " | Offset: "
-              << multi_turn_offsets_[state.id] << " \033[0m");
+                                                  << " | Last: " << last_pos
+                                                  << " | Raw: " << raw_new_pos
+                                                  << " | Turns: " << turns << " | Offset: "
+                                                  << multi_turn_offsets_[state.id] << " \033[0m");
           }
         }
       }
@@ -1635,6 +1678,9 @@ void DynamixelHardware::SyncJointCommandWithStates()
         size_t state_idx = std::distance(it_states.interface_name_vec.begin(), state_it);
         // Sync the value
         *it_commands.value_ptr_vec.at(cmd_idx) = *it_states.value_ptr_vec.at(state_idx);
+        if (use_async_) {
+          async_commands_.synchronizeCommand(it_commands.value_ptr_vec.at(cmd_idx));
+        }
         RCLCPP_INFO_STREAM(
           logger_, "Sync joint state to command (joint: " << it_states.name << ", " <<
             it_commands.interface_name_vec.at(cmd_idx).c_str() << ", " <<

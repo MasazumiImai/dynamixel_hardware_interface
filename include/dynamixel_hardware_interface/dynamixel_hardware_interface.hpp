@@ -37,6 +37,7 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 
 #include "dynamixel_hardware_interface/visibility_control.h"
+#include "dynamixel_hardware_interface/async_interface_buffer.hpp"
 #include "dynamixel_hardware_interface/dynamixel/dynamixel.hpp"
 
 #include "dynamixel_interfaces/msg/dynamixel_state.hpp"
@@ -388,10 +389,15 @@ private:
   // serial read()/write() run in a dedicated background thread owned by this
   // hardware component. With one component per limb, the 4 serial buses then
   // communicate in parallel instead of sequentially inside the single
-  // controller_manager update thread. The framework-facing read()/write() only
-  // return the latest cached status (near-zero cost), so the control loop is no
-  // longer serialized on serial I/O. This introduces up to one worker cycle of
-  // latency in each direction (equivalent to ros2_control's native is_async).
+  // controller_manager update thread. Framework-facing values are separate from
+  // the I/O handlers and exchanged as complete snapshots by read()/write().
+  // Only snapshot copies take a mutex; serial I/O never holds it.
+
+  double * exportedValue(
+    AsyncInterfaceBuffer & buffer, const HandlerVarType & handler, size_t index);
+  void bindAsyncInterfaces();
+  AsyncInterfaceBuffer async_states_;
+  AsyncInterfaceBuffer async_commands_;
 
   /// @brief Blocking serial read (the original synchronous read() body).
   hardware_interface::return_type readCommunication(
