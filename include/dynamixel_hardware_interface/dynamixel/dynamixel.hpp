@@ -261,7 +261,7 @@ public:
   DxlError SetMultiDxlWrite();
 
   // Read Item (sync or bulk)
-  DxlError ReadMultiDxlData(double period_ms);
+  DxlError ReadMultiDxlData();
   DxlError ReadStartupState();
   // Write Item (sync or bulk)
   DxlError WriteMultiDxlData();
@@ -323,13 +323,13 @@ private:
   // SyncRead
   DxlError SetSyncReadItemAndHandler();
   DxlError SetSyncReadHandler(std::vector<uint8_t> id_arr);
-  DxlError GetDxlValueFromSyncRead(double period_ms);
+  DxlError GetDxlValueFromSyncRead();
   DxlError SetFastSyncReadHandler(std::vector<uint8_t> id_arr);
 
   // BulkRead
   DxlError SetBulkReadItemAndHandler();
   DxlError SetBulkReadHandler(std::vector<uint8_t> id_arr);
-  DxlError GetDxlValueFromBulkRead(double period_ms);
+  DxlError GetDxlValueFromBulkRead();
   DxlError SetFastBulkReadHandler(std::vector<uint8_t> id_arr);
 
   // DirectRead for BulkRead
@@ -366,8 +366,6 @@ private:
 
   // Read - Communication
   DxlError ProcessReadCommunication(
-    dynamixel::PortHandler * port_handler,
-    double period_ms,
     bool is_sync,
     bool is_fast);
 

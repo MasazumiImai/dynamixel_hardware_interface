@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Regression: activation must not enable torque before fresh feedback and a confirmed stop.
+// Regressions: safe activation and receive timeouts independent of the worker period.
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -49,19 +49,25 @@ public:
   bool ignore_disable = false;
   bool fail_after_enable = false;
   bool hardware_alert = false;
+  double group_reply_delay_ms = 0;
+  bool drop_group_reply = false;
+  bool truncate_group_reply = false;
+  double elapsed_ms = 0;
+  double timeout_ms = 0;
 
   MemoryPort() {is_using_ = false;}
   bool openPort() override {return true;}
   void closePort() override {}
-  void clearPort() override {response_.clear();}
+  void clearPort() override {response_.clear(); received_bytes_ = 0;}
   void setPortName(const char *) override {}
   char * getPortName() override {return const_cast<char *>("memory");}
   bool setBaudRate(int) override {return true;}
   int getBaudRate() override {return 1000000;}
   int getBytesAvailable() override {return response_.size();}
-  void setPacketTimeout(uint16_t) override {}
-  void setPacketTimeout(double) override {}
-  bool isPacketTimeout() override {return response_.empty();}
+  // Match the Linux SDK's packet-length timeout at 1 Mbps (16 ms latency allowance).
+  void setPacketTimeout(uint16_t length) override {setPacketTimeout(length * 0.01 + 34);}
+  void setPacketTimeout(double ms) override {timeout_ms = ms; elapsed_ms = 0;}
+  bool isPacketTimeout() override {return elapsed_ms >= timeout_ms;}
 
   void set(uint8_t id, uint16_t address, uint32_t value, uint8_t size)
   {
@@ -79,11 +85,16 @@ public:
 
   int readPort(uint8_t * packet, int length) override
   {
+    elapsed_ms += 0.2;
+    if (elapsed_ms < group_reply_delay_ms) {
+      length = std::min(length, std::max(0, 16 - received_bytes_));
+    }
     const int count = std::min(length, static_cast<int>(response_.size()));
     for (int i = 0; i < count; ++i) {
       packet[i] = response_.front();
       response_.pop_front();
     }
+    received_bytes_ += count;
     return count;
   }
 
@@ -92,6 +103,8 @@ public:
     const uint8_t id = packet[4];
     const uint8_t instruction = packet[7];
     const uint16_t address = packet[8] | (packet[9] << 8);
+    const bool group_read = instruction == 0x82 || instruction == 0x8a ||
+      instruction == 0x92 || instruction == 0x9a;
     if (instruction == 2) {
       events.push_back("read:" + std::to_string(id) + ":" + std::to_string(address));
       if (address == fail_read_address ||
@@ -130,13 +143,33 @@ public:
           }
         }
       }
-    } else if (instruction == 0x82) {
-      const uint16_t size = packet[10] | (packet[11] << 8);
-      for (int i = 12; i < length - 2; ++i) {
+    } else if (group_read) {
+      const bool sync = instruction == 0x82 || instruction == 0x8a;
+      const bool fast = instruction == 0x8a || instruction == 0x9a;
+      std::vector<uint8_t> combined;
+      for (int i = sync ? 12 : 8; i < length - 2; i += sync ? 1 : 5) {
+        const uint16_t start = sync ? address : packet[i + 1] | (packet[i + 2] << 8);
+        const uint16_t size = sync ? packet[10] | (packet[11] << 8) :
+          packet[i + 3] | (packet[i + 4] << 8);
         std::vector<uint8_t> data;
-        for (uint16_t j = 0; j < size; ++j) {data.push_back(readByte(packet[i], address + j));}
-        respond(packet[i], data);
+        for (uint16_t j = 0; j < size; ++j) {data.push_back(readByte(packet[i], start + j));}
+        if (fast) {
+          combined.push_back(0);
+          combined.push_back(packet[i]);
+          combined.insert(combined.end(), data.begin(), data.end());
+          combined.insert(combined.end(), {0, 0});
+        } else {
+          respond(packet[i], data);
+        }
       }
+      if (fast) {
+        // respond() supplies the first error byte and the final CRC of the aggregate packet.
+        combined.erase(combined.begin());
+        combined.resize(combined.size() - 2);
+        respond(0xfe, combined);
+      }
+      if (drop_group_reply) {response_.clear();}
+      if (truncate_group_reply && response_.size() > 16) {response_.resize(16);}
     } else {
       throw std::runtime_error("Unexpected SDK instruction");
     }
@@ -145,6 +178,7 @@ public:
 
 private:
   std::deque<uint8_t> response_;
+  int received_bytes_ = 0;
 
   uint16_t resolve(uint8_t id, uint16_t address) const
   {
@@ -181,6 +215,65 @@ private:
 
 struct StartupCheck
 {
+  static void checkReceiveTimeout(DynamixelHardware & hardware, MemoryPort & port)
+  {
+    auto & communication = *hardware.dxl_comm_;
+    using Return = hardware_interface::return_type;
+    const rclcpp::Time time(0);
+    const auto period = rclcpp::Duration::from_seconds(0.00318605);
+    hardware.err_timeout_ms_ = 500;
+    // The worker has been joined by stop(); exercise its common read path without hardware.
+    for (bool sync : {true, false}) {
+      for (bool fast : {false, true}) {
+        communication.read_type_ = sync ? SYNC : BULK;
+        communication.use_fast_read_protocol_ = fast;
+        communication.fast_read_permanent_ = false;
+        communication.fast_read_fail_count_ = 0;
+        if (sync) {
+          require(
+            communication.SetSyncReadHandler({1, 2, 3}) == DxlError::OK,
+            "Sync read setup failed");
+        } else {
+          require(
+            communication.SetBulkReadItemAndHandler() == DxlError::OK,
+            "Bulk read setup failed");
+        }
+        // A valid reply arrives in two USB chunks, with the remainder at 4.5 ms.
+        port.group_reply_delay_ms = 4.5;
+        *hardware.hdl_trans_states_[0].value_ptr_vec[0] = -999;
+        require(hardware.readCommunication(time, period) == Return::OK, "Delayed read failed");
+        require(!hardware.is_read_in_error_, "Worker period truncated a valid delayed reply");
+        const double position = *hardware.hdl_trans_states_[0].value_ptr_vec[0];
+        require(position != -999, "Delayed read did not refresh feedback");
+        require(port.elapsed_ms >= 4.5, "Delayed reply was not exercised");
+        require(port.elapsed_ms < port.timeout_ms, "Read waited after receiving a complete reply");
+        for (bool partial : {false, true}) {
+          port.drop_group_reply = !partial;
+          port.truncate_group_reply = partial;
+          require(
+            hardware.readCommunication(time, period) == Return::OK,
+            "Transient read failure bypassed the error grace period");
+          require(hardware.is_read_in_error_, "Missing/incomplete reply was accepted");
+          require(
+            *hardware.hdl_trans_states_[0].value_ptr_vec[0] == position,
+            "Failed read overwrote the last feedback");
+          require(
+            port.elapsed_ms >= port.timeout_ms && port.elapsed_ms < 100,
+            "Receive timeout was not bounded independently of the error grace period");
+          require(
+            hardware.readCommunication(time, rclcpp::Duration::from_seconds(0.5)) == Return::ERROR,
+            "Persistent read failure bypassed the error timeout");
+          port.drop_group_reply = false;
+          port.truncate_group_reply = false;
+          require(hardware.readCommunication(time, period) == Return::OK, "Read did not recover");
+          require(!hardware.is_read_in_error_, "Successful read did not clear the error duration");
+        }
+        port.group_reply_delay_ms = 0;
+      }
+    }
+    std::cout << "Receive timeout checks passed (normal/fast SyncRead and BulkRead).\n";
+  }
+
   static void run(const char * models)
   {
     using Callback = hardware_interface::CallbackReturn;
@@ -334,6 +427,7 @@ struct StartupCheck
         require(
           std::find(port->events.begin(), port->events.end(), "on:3") == port->events.end(),
           "A passive motor was enabled");
+        if (failure == "none") {checkReceiveTimeout(hardware, *port);}
       }
     }
   }

@@ -1112,16 +1112,16 @@ DxlError Dynamixel::VerifyMultiDxlWrite()
   return DxlError::OK;
 }
 
-DxlError Dynamixel::ReadMultiDxlData(double period_ms)
+DxlError Dynamixel::ReadMultiDxlData()
 {
   if (read_data_list_.empty()) {
     return DxlError::OK;
   }
 
   if (read_type_ == SYNC) {
-    return GetDxlValueFromSyncRead(period_ms);
+    return GetDxlValueFromSyncRead();
   } else {
-    return GetDxlValueFromBulkRead(period_ms);
+    return GetDxlValueFromBulkRead();
   }
 }
 
@@ -1396,7 +1396,7 @@ DxlError Dynamixel::SetSyncReadHandler(std::vector<uint8_t> id_arr)
   return DxlError::OK;
 }
 
-DxlError Dynamixel::GetDxlValueFromSyncRead(double period_ms)
+DxlError Dynamixel::GetDxlValueFromSyncRead()
 {
   // Try fast sync read for the first 10 attempts after startup/handler setup.
   // If any of the first 10 attempts succeeds, use fast sync read permanently.
@@ -1404,7 +1404,7 @@ DxlError Dynamixel::GetDxlValueFromSyncRead(double period_ms)
   if (use_fast_read_protocol_ && group_fast_sync_read_ &&
     (fast_read_permanent_ || fast_read_fail_count_ < 10))
   {
-    DxlError comm_result = ProcessReadCommunication(port_handler_, period_ms, true, true);
+    DxlError comm_result = ProcessReadCommunication(true, true);
     if (comm_result == DxlError::OK) {
       // Success, process data, and use fast sync read permanently
       for (auto it_read_data : read_data_list_) {
@@ -1449,7 +1449,7 @@ DxlError Dynamixel::GetDxlValueFromSyncRead(double period_ms)
     }
   }
   // Use normal sync read
-  DxlError comm_result = ProcessReadCommunication(port_handler_, period_ms, true, false);
+  DxlError comm_result = ProcessReadCommunication(true, false);
   if (comm_result != DxlError::OK) {
     return comm_result;
   }
@@ -1713,7 +1713,7 @@ DxlError Dynamixel::AddDirectRead(
   return DxlError::OK;
 }
 
-DxlError Dynamixel::GetDxlValueFromBulkRead(double period_ms)
+DxlError Dynamixel::GetDxlValueFromBulkRead()
 {
   // Try fast bulk read for the first 10 attempts after startup/handler setup.
   // If any of the first 10 attempts succeeds, use fast bulk read permanently.
@@ -1721,7 +1721,7 @@ DxlError Dynamixel::GetDxlValueFromBulkRead(double period_ms)
   if (use_fast_read_protocol_ && group_fast_bulk_read_ &&
     (fast_read_permanent_ || fast_read_fail_count_ < 10))
   {
-    DxlError comm_result = ProcessReadCommunication(port_handler_, period_ms, false, true);
+    DxlError comm_result = ProcessReadCommunication(false, true);
     if (comm_result == DxlError::OK) {
       // Success, process data, and use fast bulk read permanently
       if (group_bulk_read_) {
@@ -1790,7 +1790,7 @@ DxlError Dynamixel::GetDxlValueFromBulkRead(double period_ms)
       return comm_result;
     }
   }
-  DxlError comm_result = ProcessReadCommunication(port_handler_, period_ms, false, false);
+  DxlError comm_result = ProcessReadCommunication(false, false);
   if (comm_result != DxlError::OK) {
     return comm_result;
   }
@@ -1825,8 +1825,6 @@ DxlError Dynamixel::GetDxlValueFromBulkRead(double period_ms)
 }
 
 DxlError Dynamixel::ProcessReadCommunication(
-  dynamixel::PortHandler * port_handler,
-  double period_ms,
   bool is_sync,
   bool is_fast)
 {
@@ -1866,10 +1864,8 @@ DxlError Dynamixel::ProcessReadCommunication(
     }
   }
 
-  // Set timeout if period_ms is specified
-  if (period_ms > 0) {
-    port_handler->setPacketTimeout(period_ms);
-  }
+  // Keep the SDK timeout set by txPacket(): packet size and USB latency determine
+  // the receive budget, independently of the control or asynchronous worker period.
 
   // Receive packet
   if (is_sync) {

@@ -838,8 +838,6 @@ hardware_interface::return_type DynamixelHardware::read(
 hardware_interface::return_type DynamixelHardware::readCommunication(
   [[maybe_unused]] const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  double period_ms = period.seconds() * 1000;
-
   if (dxl_status_ == REBOOTING) {
     // Hold the last state and report OK so the controller_manager keeps this and every other
     // limb's controller active while this bus reboots. Returning ERROR here would deactivate the
@@ -848,7 +846,7 @@ hardware_interface::return_type DynamixelHardware::readCommunication(
       logger_, clock_, 1000, "Dynamixel rebooting: holding last state (control stays active).");
     return hardware_interface::return_type::OK;
   } else if (dxl_status_ == DXL_OK || dxl_status_ == COMM_ERROR || dxl_status_ == HW_ERROR) {
-    dxl_comm_err_ = CheckError(dxl_comm_->ReadMultiDxlData(period_ms));
+    dxl_comm_err_ = CheckError(dxl_comm_->ReadMultiDxlData());
     if (dxl_comm_err_ != DxlError::OK && dxl_comm_err_ != DxlError::DXL_HARDWARE_ERROR) {
       if (!is_read_in_error_) {
         is_read_in_error_ = true;
@@ -1138,7 +1136,7 @@ bool DynamixelHardware::CommReset()
 
     // Read the "raw zero-lap position" immediately after reboot and
     // calculate the number of laps out of sync
-    dxl_comm_->ReadMultiDxlData(0.0);
+    dxl_comm_->ReadMultiDxlData();
     for (auto & state : hdl_trans_states_) {
       for (size_t i = 0; i < state.interface_name_vec.size(); ++i) {
         if (state.interface_name_vec[i] == "Present Position") {
