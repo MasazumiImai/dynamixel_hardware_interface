@@ -81,7 +81,8 @@ struct HardwareErrorStatusBitInfo
 };
 
 static constexpr HardwareErrorStatusBitInfo HardwareErrorStatusTable[] = {
-  {0, "Input Voltage Error", "Detects that input voltage exceeds the configured operating voltage"},
+  {0, "Input Voltage Error",
+    "Detects that input voltage is outside the configured operating voltage range"},
   {1, "Motor Hall Sensor Error", "Detects that Motor hall sensor value exceeds normal range"},
   {2, "Overheating Error",
     "Detects that internal temperature exceeds the configured operating temperature"},
@@ -113,7 +114,7 @@ struct ErrorCodeInfo
 static constexpr ErrorCodeInfo ErrorCodeTable[] = {
   {0x00, "No Error", "No error"},
   {0x01, "Over Voltage Error", "Device supply voltage exceeds the Max Voltage Limit(60)"},
-  {0x02, "Low Voltage Error", "Device supply voltage exceeds the Min Voltage Limit(62)"},
+  {0x02, "Low Voltage Error", "Device supply voltage is below the Min Voltage Limit(62)"},
   {0x03,
     "Inverter Overheating Error",
     "The inverter temperature has exceeded the Inverter Temperature Limit(56)"},

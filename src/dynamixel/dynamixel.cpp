@@ -1276,12 +1276,12 @@ DxlError Dynamixel::SetSyncReadItemAndHandler()
         fprintf(
           stderr,
           "[ID:%03d] Failed to Set Indirect Address Read Item: [%s], Addr: %d, Size: %d, "
-          "Error code: %d\n",
+          "Error: %s\n",
           it_read_data.comm_id,
           it_read_data.item_name.at(item_index).c_str(),
           it_read_data.item_addr.at(item_index),
           it_read_data.item_size.at(item_index),
-          result);
+          DxlErrorToString(result).c_str());
         return DxlError::SET_SYNC_READ_FAIL;
       }
     }
@@ -1563,12 +1563,12 @@ DxlError Dynamixel::SetBulkReadItemAndHandler()
         fprintf(
           stderr,
           "[ID:%03d] Failed to Set Indirect Address Read Item : [%s], Addr: %d, Size: %d, "
-          "Error code: %d\n",
+          "Error: %s\n",
           it_read_data.comm_id,
           it_read_data.item_name.at(item_index).c_str(),
           it_read_data.item_addr.at(item_index),
           it_read_data.item_size.at(item_index),
-          result);
+          DxlErrorToString(result).c_str());
         return DxlError::INDIRECT_ADDR_FAIL;
       } else if (result == DxlError::CANNOT_FIND_CONTROL_ITEM) {
         fprintf(
@@ -1841,9 +1841,10 @@ DxlError Dynamixel::ProcessReadCommunication(
     }
     if (dxl_comm_result != COMM_SUCCESS) {
       fprintf(
-        stderr, "%s Tx Fail [Dxl Size : %ld] [Error code : %d]\n",
-        is_fast ? "FastSyncRead" : "SyncRead",
-        read_data_list_.size(), dxl_comm_result);
+        stderr, "[port:%s] %s transmit failed: %s (code=%d, motors=%zu)\n",
+        port_handler_->getPortName(), is_fast ? "FastSyncRead" : "SyncRead",
+        packet_handler_->getTxRxResult(dxl_comm_result), dxl_comm_result,
+        read_data_list_.size());
       return DxlError::SYNC_READ_FAIL;
     }
   } else {
@@ -1857,9 +1858,10 @@ DxlError Dynamixel::ProcessReadCommunication(
     }
     if (dxl_comm_result != COMM_SUCCESS) {
       fprintf(
-        stderr, "%s Tx Fail [Dxl Size : %ld] [Error code : %d]\n",
-        is_fast ? "FastBulkRead" : "BulkRead",
-        read_data_list_.size(), dxl_comm_result);
+        stderr, "[port:%s] %s transmit failed: %s (code=%d, motors=%zu)\n",
+        port_handler_->getPortName(), is_fast ? "FastBulkRead" : "BulkRead",
+        packet_handler_->getTxRxResult(dxl_comm_result), dxl_comm_result,
+        read_data_list_.size());
       return DxlError::BULK_READ_FAIL;
     }
   }
@@ -1878,9 +1880,10 @@ DxlError Dynamixel::ProcessReadCommunication(
     }
     if (dxl_comm_result != COMM_SUCCESS) {
       fprintf(
-        stderr, "%s Rx Fail [Dxl Size : %ld] [Error code : %d]\n",
-        is_fast ? "FastSyncRead" : "SyncRead",
-        read_data_list_.size(), dxl_comm_result);
+        stderr, "[port:%s] %s receive failed: %s (code=%d, motors=%zu)\n",
+        port_handler_->getPortName(), is_fast ? "FastSyncRead" : "SyncRead",
+        packet_handler_->getTxRxResult(dxl_comm_result), dxl_comm_result,
+        read_data_list_.size());
       return DxlError::SYNC_READ_FAIL;
     }
   } else {
@@ -1894,9 +1897,10 @@ DxlError Dynamixel::ProcessReadCommunication(
     }
     if (dxl_comm_result != COMM_SUCCESS) {
       fprintf(
-        stderr, "%s Rx Fail [Dxl Size : %ld] [Error code : %d]\n",
-        is_fast ? "FastBulkRead" : "BulkRead",
-        read_data_list_.size(), dxl_comm_result);
+        stderr, "[port:%s] %s receive failed: %s (code=%d, motors=%zu)\n",
+        port_handler_->getPortName(), is_fast ? "FastBulkRead" : "BulkRead",
+        packet_handler_->getTxRxResult(dxl_comm_result), dxl_comm_result,
+        read_data_list_.size());
       return DxlError::BULK_READ_FAIL;
     }
   }
@@ -2157,7 +2161,10 @@ DxlError Dynamixel::SetDxlValueToSyncWrite()
   group_sync_write_->clearParam();
 
   if (dxl_comm_result != COMM_SUCCESS) {
-    fprintf(stderr, "%s\n", packet_handler_->getTxRxResult(dxl_comm_result));
+    fprintf(
+      stderr, "[port:%s] SyncWrite transmit failed: %s (code=%d)\n",
+      port_handler_->getPortName(), packet_handler_->getTxRxResult(dxl_comm_result),
+      dxl_comm_result);
     return DxlError::SYNC_WRITE_FAIL;
   } else {
     return DxlError::OK;
@@ -2372,7 +2379,10 @@ DxlError Dynamixel::SetDxlValueToBulkWrite()
   group_bulk_write_->clearParam();
 
   if (dxl_comm_result != COMM_SUCCESS) {
-    fprintf(stderr, "%s\n", packet_handler_->getTxRxResult(dxl_comm_result));
+    fprintf(
+      stderr, "[port:%s] BulkWrite transmit failed: %s (code=%d)\n",
+      port_handler_->getPortName(), packet_handler_->getTxRxResult(dxl_comm_result),
+      dxl_comm_result);
     return DxlError::BULK_WRITE_FAIL;
   } else {
     return DxlError::OK;

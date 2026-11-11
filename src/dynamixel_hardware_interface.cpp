@@ -937,7 +937,8 @@ hardware_interface::return_type DynamixelHardware::writeCommunication(
 
     RCLCPP_ERROR_STREAM(
       logger_,
-      "Dynamixel Write Fail (Duration: " << write_error_duration_.seconds() * 1000 << "ms/" <<
+      "Dynamixel write skipped on " << port_name_ << ": preceding read failed " <<
+        "(consecutive error duration: " << write_error_duration_.seconds() * 1000 << "ms/" <<
         err_timeout_ms_ << "ms)");
 
     if (write_error_duration_.seconds() * 1000 >= err_timeout_ms_) {
@@ -994,73 +995,71 @@ DxlError DynamixelHardware::CheckError(DxlError dxl_comm_err)
   dxl_status_ = DXL_OK;
 
   // check comm error
+  if (dxl_comm_err == DxlError::DXL_HARDWARE_ERROR) {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+      logger_, clock_, 1000,
+      "Motor reported a hardware fault on " << port_name_ <<
+        "; see the device read log for details.");
+    dxl_status_ = HW_ERROR;
+    return dxl_comm_err;
+  }
   if (dxl_comm_err != DxlError::OK) {
     RCLCPP_ERROR_STREAM_THROTTLE(
       logger_, clock_, 1000,
-      "Communication Fail --> " << Dynamixel::DxlErrorToString(dxl_comm_err));
+      "Communication error on " << port_name_ << ": " <<
+        Dynamixel::DxlErrorToString(dxl_comm_err) << "; see the packet failure log for details.");
     dxl_status_ = COMM_ERROR;
     return dxl_comm_err;
   }
 
-  // check hardware error
-  for (size_t i = 0; i < num_of_transmissions_; i++) {
-    for (size_t j = 0; j < hdl_trans_states_.at(i).interface_name_vec.size(); j++) {
-      if (hdl_trans_states_.at(i).interface_name_vec.at(j) == "Hardware Error Status") {
-        dxl_hw_err_[hdl_trans_states_.at(i).id] =
-          static_cast<uint8_t>(*hdl_trans_states_.at(i).value_ptr_vec.at(j));
-        uint8_t hw_error_status = static_cast<uint8_t>(dxl_hw_err_[hdl_trans_states_.at(i).id]);
-        std::string error_string = "";
-
-        // Check each bit in the hardware error status
-        for (int bit = 0; bit < 8; ++bit) {
-          if (hw_error_status & (1 << bit)) {
-            const HardwareErrorStatusBitInfo * bit_info = get_hardware_error_status_bit_info(bit);
-            if (bit_info) {
-              error_string += bit_info->label;
-              error_string += " (" + std::string(bit_info->description) + ")/ ";
-            } else {
-              error_string += "Unknown Error Bit " + std::to_string(bit) + "/ ";
-            }
-          }
-        }
-
-        if (!error_string.empty()) {
-          RCLCPP_ERROR_STREAM_THROTTLE(
-            logger_, clock_, 1000,
-            "\033[1;31m[Dynamixel Hardware Error] ID:" <<
-              static_cast<int>(hdl_trans_states_.at(i).id) << " --> " <<
-              "0x" << std::hex << static_cast<int>(hw_error_status) << std::dec <<
-              " (" << static_cast<int>(hw_error_status) << "): " << error_string << "\033[0m");
-          dxl_status_ = HW_ERROR;
-          error_state = DxlError::DXL_HARDWARE_ERROR;
+  // Inspect fresh feedback only; a communication failure must not re-label stale motor faults.
+  for (const auto & motor : hdl_trans_states_) {
+    const auto previous_hw_error = dxl_hw_err_[motor.id];
+    const auto previous_error_code = dxl_error_code_[motor.id];
+    std::string measured_torque = "not sampled";
+    for (size_t j = 0; j < motor.interface_name_vec.size(); ++j) {
+      const auto & name = motor.interface_name_vec[j];
+      const auto value = *motor.value_ptr_vec[j];
+      if (name == "Hardware Error Status") {
+        dxl_hw_err_[motor.id] = static_cast<uint8_t>(value);
+      } else if (name == "Error Code") {
+        dxl_error_code_[motor.id] = static_cast<uint8_t>(value);
+      } else if (name == "Torque Enable") {
+        measured_torque = value == 0 ? "OFF" : "ON";
+      }
+    }
+    const bool motor_fault = dxl_hw_err_[motor.id] != 0 || dxl_error_code_[motor.id] != 0;
+    const bool changed = previous_hw_error != dxl_hw_err_[motor.id] ||
+      previous_error_code != dxl_error_code_[motor.id];
+    if (motor_fault) {
+      if (changed) {
+        // Read the actual device setting only on a fault transition, on the bus-owning thread.
+        uint32_t shutdown = 0;
+        const bool classified = dxl_hw_err_[motor.id] != 0 &&
+          dxl_comm_->ReadItem(motor.comm_id, motor.id, "Shutdown", shutdown) == DxlError::OK;
+        const bool shutdown_target = classified && (dxl_hw_err_[motor.id] & shutdown) != 0;
+        const char * color = !classified ? "" : shutdown_target ? "\033[1;31m" : "\033[1;33m";
+        std::ostringstream message;
+        message << color << "Motor hardware fault: " << motor.name << " [" <<
+          (!classified ? "Shutdown classification unavailable" :
+        shutdown_target ? "Shutdown target" : "not a Shutdown target") << "]" <<
+          (classified ? "\033[0m" : "") << " [ID:" << static_cast<int>(motor.id) <<
+          ", comm_id:" << static_cast<int>(motor.comm_id) <<
+          ", measured Torque Enable:" << measured_torque << "]\n" <<
+          getErrorSummary(motor.id, classified ? static_cast<int>(shutdown) : -1);
+        // A throttle shared by this loop would hide simultaneous faults in other motors.
+        if (classified && !shutdown_target) {
+          RCLCPP_WARN_STREAM(logger_, message.str());
+        } else {
+          RCLCPP_ERROR_STREAM(logger_, message.str());
         }
       }
-      if (hdl_trans_states_.at(i).interface_name_vec.at(j) == "Error Code") {
-        dxl_error_code_[hdl_trans_states_.at(i).id] =
-          static_cast<uint8_t>(*hdl_trans_states_.at(i).value_ptr_vec.at(j));
-        uint8_t error_code = static_cast<uint8_t>(dxl_error_code_[hdl_trans_states_.at(i).id]);
-
-        if (error_code != 0x00) {
-          const ErrorCodeInfo * error_info = get_error_code_info(error_code);
-          if (error_info) {
-            RCLCPP_ERROR_STREAM_THROTTLE(
-              logger_, clock_, 1000,
-              "\033[1;31m[Dynamixel Error Code] ID:" <<
-                static_cast<int>(hdl_trans_states_.at(i).id) << " --> " <<
-                "0x" << std::hex << static_cast<int>(error_code) << std::dec <<
-                " (" << error_info->label << "): " << error_info->description << "\033[0m");
-          } else {
-            RCLCPP_ERROR_STREAM_THROTTLE(
-              logger_, clock_, 1000,
-              "\033[1;31m[Dynamixel Error Code] ID:" <<
-                static_cast<int>(hdl_trans_states_.at(i).id) << " --> " <<
-                "0x" << std::hex << static_cast<int>(error_code) << std::dec <<
-                " (Unknown Error Code)\033[0m");
-          }
-          dxl_status_ = HW_ERROR;
-          error_state = DxlError::DXL_HARDWARE_ERROR;
-        }
-      }
+      dxl_status_ = HW_ERROR;
+      error_state = DxlError::DXL_HARDWARE_ERROR;
+    } else if (changed) {
+      RCLCPP_INFO_STREAM(
+        logger_, "Motor hardware fault status cleared: " << motor.name << " [ID:" <<
+          static_cast<int>(motor.id) << ", measured Torque Enable:" << measured_torque << "]");
     }
   }
 
@@ -1977,7 +1976,7 @@ double DynamixelHardware::prismaticToRevolute(double prismatic_value)
   return (prismatic_value - conversion_intercept_) / conversion_slope_;
 }
 
-std::string DynamixelHardware::getErrorSummary(uint8_t id) const
+std::string DynamixelHardware::getErrorSummary(uint8_t id, int shutdown_mask) const
 {
   std::ostringstream summary;
   summary << "Dynamixel ID " << static_cast<int>(id) << " Error Summary:\n";
@@ -1991,13 +1990,22 @@ std::string DynamixelHardware::getErrorSummary(uint8_t id) const
 
     for (int bit = 0; bit < 8; ++bit) {
       if (hw_error_status & (1 << bit)) {
+        const bool shutdown_target = shutdown_mask >= 0 && (shutdown_mask & (1 << bit)) != 0;
+        if (shutdown_mask >= 0) {
+          summary << (shutdown_target ? "\033[1;31m" : "\033[1;33m");
+        }
         const HardwareErrorStatusBitInfo * bit_info = get_hardware_error_status_bit_info(bit);
         if (bit_info) {
           summary << "    Bit " << bit << ": " << bit_info->label
-                  << " - " << bit_info->description << "\n";
+                  << " - " << bit_info->description;
         } else {
-          summary << "    Bit " << bit << ": Unknown Error\n";
+          summary << "    Bit " << bit << ": Unknown Error";
         }
+        if (shutdown_mask >= 0) {
+          summary << (shutdown_target ? " [Shutdown target]" : " [not a Shutdown target]") <<
+            "\033[0m";
+        }
+        summary << "\n";
       }
     }
   }

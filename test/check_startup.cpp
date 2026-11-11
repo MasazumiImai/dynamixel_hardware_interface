@@ -15,6 +15,7 @@
 // Regressions: safe activation and receive timeouts independent of the worker period.
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <deque>
 #include <iostream>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "dynamixel_hardware_interface/dynamixel_hardware_interface.hpp"
+#include "rcutils/logging.h"
 
 namespace dynamixel_hardware_interface
 {
@@ -215,6 +217,113 @@ private:
 
 struct StartupCheck
 {
+  static void checkFaultLogs(DynamixelHardware & hardware, MemoryPort & port)
+  {
+    // All workers are stopped here. Capture the real ROS log sink, including simultaneous faults.
+    static std::string messages;
+    static std::vector<int> severities;
+    messages.clear();
+    severities.clear();
+    const auto previous_handler = rcutils_logging_get_output_handler();
+    rcutils_logging_set_output_handler(
+      [](const rcutils_log_location_t *, int severity, const char *, rcutils_time_point_value_t,
+      const char * format, va_list * args) {
+        char buffer[4096];
+        std::vsnprintf(buffer, sizeof(buffer), format, *args);
+        messages += buffer;
+        severities.push_back(severity);
+      });
+    const rclcpp::Time time(0);
+    const auto period = rclcpp::Duration::from_seconds(0.003);
+    // Nonzero motor current alone does not identify an Overload Error.
+    port.set(1, 126, 1000, 2);
+    hardware.readCommunication(time, period);
+    const bool no_false_overload = messages.find("hardware fault:") == std::string::npos;
+    port.set(1, 63, 0x34, 1);
+    port.set(2, 63, 0, 1);
+    port.set(1, 70, 0x20, 1);
+    port.set(2, 70, 0x05, 1);
+    // Classification follows Shutdown, independently of whether torque is currently ON or OFF.
+    port.set(1, 64, 1, 1);
+    port.hardware_alert = true;
+    hardware.readCommunication(time, period);
+    port.hardware_alert = false;
+    const std::string fault_messages = messages;
+    const bool levels_correct = severities ==
+      std::vector<int>{RCUTILS_LOG_SEVERITY_ERROR, RCUTILS_LOG_SEVERITY_WARN};
+    const bool colors_correct =
+      messages.find("\033[1;31mMotor hardware fault: joint1 [Shutdown target]\033[0m") !=
+      std::string::npos &&
+      messages.find("\033[1;33mMotor hardware fault: joint2 [not a Shutdown target]\033[0m") !=
+      std::string::npos &&
+      messages.find("\033[1;31m    Bit 5: Overload Error") != std::string::npos &&
+      messages.find("\033[1;33m    Bit 2: Overheating Error") != std::string::npos;
+    const bool plain_summary_unchanged =
+      hardware.getErrorSummary(1).find('\033') == std::string::npos;
+    const auto fault_state = hardware.dxl_status_;
+    messages.clear();
+    hardware.readCommunication(time, period);
+    const bool no_repeat = messages.empty();
+    // A later bus error must not be reported as a fresh motor hardware fault.
+    hardware.CheckError(DxlError::SYNC_READ_FAIL);
+    const bool distinct_comm_error = hardware.dxl_status_ == COMM_ERROR &&
+      messages.find("Motor hardware fault:") == std::string::npos;
+    port.set(1, 70, 0, 1);
+    port.set(2, 70, 0, 1);
+    messages.clear();
+    hardware.readCommunication(time, period);
+    const bool recovered = hardware.dxl_status_ == DXL_OK &&
+      messages.find("fault status cleared: joint1") != std::string::npos &&
+      messages.find("fault status cleared: joint2") != std::string::npos;
+    // A changed fault must be logged immediately, even within the former one-second throttle.
+    port.set(1, 70, 0x08, 1);
+    messages.clear();
+    hardware.readCommunication(time, period);
+    const bool changed_logged = messages.find("Motor Encoder Error") != std::string::npos;
+    // Mixed errors use per-bit colors rather than marking every fault as a Shutdown target.
+    port.set(1, 70, 0x21, 1);
+    messages.clear();
+    hardware.readCommunication(time, period);
+    const bool mixed_colors_correct =
+      messages.find("\033[1;31m    Bit 5: Overload Error") != std::string::npos &&
+      messages.find("\033[1;33m    Bit 0: Input Voltage Error") != std::string::npos;
+    // An unreadable setting must not be misclassified as a non-Shutdown fault.
+    port.fail_read_address = 63;
+    port.set(1, 70, 0x04, 1);
+    messages.clear();
+    severities.clear();
+    hardware.readCommunication(time, period);
+    const bool unknown_is_explicit =
+      messages.find("Shutdown classification unavailable") != std::string::npos &&
+      messages.find("not a Shutdown target") == std::string::npos &&
+      severities == std::vector<int>{RCUTILS_LOG_SEVERITY_ERROR};
+    port.fail_read_address = -1;
+    port.set(1, 64, 0, 1);
+    port.set(1, 70, 0, 1);
+    hardware.readCommunication(time, period);
+    hardware.CheckError(DxlError::DXL_HARDWARE_ERROR);
+    const bool alert_is_hardware_error = hardware.dxl_status_ == HW_ERROR;
+    hardware.CheckError(DxlError::OK);
+    rcutils_logging_set_output_handler(previous_handler);
+    require(no_false_overload, "An unreported current-limit fault was invented");
+    require(fault_state == HW_ERROR, "Motor faults were classified as a communication failure");
+    for (const char * text : {"joint1", "ID:1", "joint2", "ID:2", "Overload Error",
+        "Overheating Error", "Input Voltage Error", "measured Torque Enable:OFF"})
+    {
+      require(fault_messages.find(text) != std::string::npos, "Motor fault details were lost");
+    }
+    require(no_repeat, "An unchanged motor fault flooded the logs");
+    require(levels_correct && colors_correct, "Shutdown classification or log color was wrong");
+    require(mixed_colors_correct, "Mixed Shutdown and non-Shutdown errors lost per-bit colors");
+    require(
+      unknown_is_explicit,
+      "Unreadable Shutdown configuration was classified as non-Shutdown");
+    require(plain_summary_unchanged, "Plain error summaries acquired terminal color escapes");
+    require(distinct_comm_error, "A communication error was re-labelled as a motor fault");
+    require(recovered && changed_logged && alert_is_hardware_error, "Fault transitions were lost");
+    std::cout << fault_messages << "Motor fault log checks passed.\n";
+  }
+
   static void checkReceiveTimeout(DynamixelHardware & hardware, MemoryPort & port)
   {
     auto & communication = *hardware.dxl_comm_;
@@ -309,8 +418,12 @@ struct StartupCheck
           hardware.dxl_comm_id_id_.emplace_back(id, id);
           if (id != 3) {hardware.torque_enabled_comm_id_id_.emplace_back(id, id);}
           const std::string name = "joint" + std::to_string(id);
-          HandlerVarType state{id, id, name, {"Present Position", "Present Velocity"},
-            {std::make_shared<double>(0), std::make_shared<double>(0)}};
+          HandlerVarType state{id, id, name,
+            {"Present Position", "Present Velocity", "Present Current",
+              "Hardware Error Status", "Torque Enable"},
+            {std::make_shared<double>(0), std::make_shared<double>(0),
+              std::make_shared<double>(0), std::make_shared<double>(0),
+              std::make_shared<double>(0)}};
           HandlerVarType command{id, id, name, {}, {}};
           if (id != 3) {
             command.interface_name_vec = {position_mode ? "Goal Position" : "Goal Velocity"};
@@ -427,7 +540,10 @@ struct StartupCheck
         require(
           std::find(port->events.begin(), port->events.end(), "on:3") == port->events.end(),
           "A passive motor was enabled");
-        if (failure == "none") {checkReceiveTimeout(hardware, *port);}
+        if (failure == "none") {
+          checkReceiveTimeout(hardware, *port);
+          checkFaultLogs(hardware, *port);
+        }
       }
     }
   }

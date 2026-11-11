@@ -354,9 +354,10 @@ private:
   /**
    * @brief Get a formatted error summary for a specific Dynamixel ID
    * @param id The Dynamixel ID
+   * @param shutdown_mask Device Shutdown bitmask; negative leaves the summary uncolored
    * @return A string containing the error summary
    */
-  std::string getErrorSummary(uint8_t id) const;
+  std::string getErrorSummary(uint8_t id, int shutdown_mask = -1) const;
 
   /**
    * @brief Get error summaries for all Dynamixel IDs
